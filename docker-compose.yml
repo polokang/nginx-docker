@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  nginx:
+    image: adminpage.azurecr.io/nginx-docker:latest
+    container_name: nginx-reverse-proxy
+    restart: always
+    ports:
+      - "80:80"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sI http://127.0.0.1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    volumes:
+      - ./logs:/var/log/nginx
+    # 这一行确保了 host.docker.internal 可以正确映射到宿主机（服务器）的 IP，兼容 Linux 服务器
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
