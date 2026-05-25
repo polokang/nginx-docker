@@ -6,6 +6,6 @@ COPY nginx.conf /etc/nginx/nginx.conf
 # 创建日志目录
 RUN mkdir -p /var/log/nginx
 
-EXPOSE 80
+EXPOSE 80 443
 
 CMD ["nginx", "-g", "daemon off;"]

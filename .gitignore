@@ -1,0 +1,6 @@
+# Runtime data (do NOT commit)
+logs/
+certs/
+acme/
+*.log
+nginx.http.conf.bak
