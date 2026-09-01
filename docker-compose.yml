@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   nginx:
-    image: adminpage.azurecr.io/nginx-docker:latest
+    image: adminpage.azurecr.io/nginx-docker:https
     container_name: nginx-reverse-proxy
     restart: always
     ports:

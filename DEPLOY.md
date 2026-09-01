@@ -1,13 +1,17 @@
 # 部署：Nginx + Let's Encrypt（HTTP-01 临时开 80 方案）
 
-本文档手把手把现有的 HTTP-only 反代升级到 HTTPS，证书由 Let's Encrypt
-免费签发，**不需要把服务长期对公网开放** —— 仅在签发 / 续期那几秒钟
-临时打开 80 端口。
+把现有 HTTP-only 反代升级到 HTTPS，证书由 Let's Encrypt 免费签发。**服务保持只在公司内网可访问**，仅在签发那几秒钟把 80 端口临时对外开放。
 
-适用范围：
-- 内网用户（出公司就访问不了）的内部业务系统
-- 已有自建 Nginx 镜像 + Docker Compose 部署架构
-- 需要浏览器原生信任的证书（例如启用 Passkey / WebAuthn）
+发布方式沿用既有工作流：**所有配置烧进 image，服务器上只放一个 `docker-compose.yml`**。
+
+**当前域名策略**：
+
+| 域名 | 协议 | 用途 |
+|---|---|---|
+| `pro.aquareporter.com.au` | **HTTPS**（Let's Encrypt 证书） | Aquareporter（Passkey 需要 secure context） |
+| `aquadev.aquareporter.com.au` | **HTTP** | adminpage 内网访问，不做 TLS 终结 |
+
+Image：`adminpage.azurecr.io/nginx-docker:https`
 
 ---
 
@@ -15,58 +19,46 @@
 
 | 项 | 要求 |
 |---|---|
-| DNS | `pro.aquareporter.com.au` 与 `aquadev.aquareporter.com.au` 的 A 记录指向本机公网 IP（不开 Cloudflare Proxy） |
-| 防火墙 | TCP 80、TCP 443 入站规则能临时打开（签发时 80 短暂开放，关闭后 443 长期开放给内网） |
+| DNS | `pro.aquareporter.com.au` 的 A 记录指向本机公网 IP（不开 Cloudflare Proxy）；aquadev 同上但不签证书 |
+| 防火墙 | TCP 80 能临时打开（签发用）、TCP 443 长期对内网开放 |
 | 时间 | 服务器时间正确（NTP 同步） |
-| 邮箱 | 一个可接收续期失败通知的邮箱 |
-
-> ⚠️ 如果服务器在公司防火墙后无法对外暴露 80，本方案不适用，请改用
-> DNS-01 challenge（需要 DNS 服务商 API token）。
+| 邮箱 | 一个 Let's Encrypt 通知用邮箱 |
+| ACR 登录 | 本地能 `docker push` 到 `adminpage.azurecr.io` |
 
 ---
 
-## 1. 同步代码
+## 1️⃣ 本地构建 + 推送"阶段 1" image（HTTP-only）
 
-在服务器上：
+```powershell
+cd D:\workspace\nginx-docker
+
+# 当前仓库内的 nginx.conf 默认就是阶段 1（HTTP + ACME challenge）
+docker build -t adminpage.azurecr.io/nginx-docker:https .
+docker push adminpage.azurecr.io/nginx-docker:https
+```
+
+> 这次推送的 image 内包含阶段 1 的 nginx.conf，让 80 端口能响应 Let's Encrypt 的 ACME challenge。
+
+---
+
+## 2️⃣ 服务器准备目录 + 起 nginx
+
+服务器上**只需要一个文件** `docker-compose.yml`，其他配置全在 image 里。
 
 ```bash
+mkdir -p ~/nginx-docker/{certs,acme,logs}
 cd ~/nginx-docker
-git pull
-ls
-# 应该看到：DEPLOY.md  Dockerfile  docker-compose.yml  nginx.conf
-#           nginx.https.conf  renew.sh  readme.md  logs/
-```
 
-首次还需要：
+# 把本地的 docker-compose.yml 内容粘贴过去
+vi docker-compose.yml
+# :set paste -> i -> 鼠标粘贴 -> Esc -> :set ff=unix -> :wq
 
-```bash
-chmod +x renew.sh
-mkdir -p certs acme
-```
-
----
-
-## 2. 构建并推到 ACR（如果你的部署是从 ACR 拉镜像）
-
-> 如果你在生产服务器**直接构建本地用**，跳过 push 那步即可。
-
-```bash
-cd ~/nginx-docker
-docker build -t adminpage.azurecr.io/nginx-docker:latest .
-docker push adminpage.azurecr.io/nginx-docker:latest
-```
-
----
-
-## 3. 拉起 nginx（阶段 1：HTTP-only + ACME challenge）
-
-```bash
-docker compose pull           # 如果是从 ACR 拉
+docker compose pull
 docker compose up -d
-docker compose ps             # nginx-reverse-proxy 应该是 Up (healthy)
+docker compose ps          # nginx-reverse-proxy 应为 Up
 ```
 
-验证业务可访问（内网即可）：
+内网验证业务还能访问：
 
 ```bash
 curl -I http://pro.aquareporter.com.au
@@ -75,88 +67,66 @@ curl -I http://aquadev.aquareporter.com.au
 
 ---
 
-## 4. 临时放行 80 端口
+## 3️⃣ 临时放行 80 端口
 
-> ⚠️ 这一步会让你的服务**短暂暴露在公网**。务必接下来几分钟内完成签发并关闭。
+公司防火墙 / 云安全组里给 TCP 80 加一条"任意来源允许"入站规则。
 
-打开公司防火墙 / 云安全组，对 TCP 80 添加"任意来源允许"入站规则。
-
-**从外网手机 4G/5G** 验证 80 能被外面访问到：
-
-```
-访问  http://pro.aquareporter.com.au
-应看到正常业务页面（或任意非"连接超时"的响应）
-```
+**用手机 4G/5G**（脱离公司 WiFi）访问 `http://pro.aquareporter.com.au`，能看到任意响应（不超时）即可。
 
 ---
 
-## 5. 用 staging 环境先跑一次（避免触发正式 Let's Encrypt 限速）
+## 4️⃣ 签发证书（仅 pro）
 
 ```bash
-docker compose run --rm --entrypoint certbot certbot \
-  certonly --webroot -w /var/www/certbot \
-  --staging \
-  -d pro.aquareporter.com.au \
-  --email YOUR_EMAIL@example.com --agree-tos --no-eff-email -n
-```
+cd ~/nginx-docker
 
-成功输出包含 `Successfully received certificate`。然后清掉 staging 证书：
-
-```bash
-docker compose run --rm --entrypoint certbot certbot \
-  delete --cert-name pro.aquareporter.com.au -n
-```
-
----
-
-## 6. 正式签发两个域名
-
-**pro：**
-
-```bash
+# pro
 docker compose run --rm --entrypoint certbot certbot \
   certonly --webroot -w /var/www/certbot \
   -d pro.aquareporter.com.au \
   --email YOUR_EMAIL@example.com --agree-tos --no-eff-email -n
 ```
 
-**aquadev：**
+看到 `Successfully received certificate` 后验证：
 
 ```bash
-docker compose run --rm --entrypoint certbot certbot \
-  certonly --webroot -w /var/www/certbot \
-  -d aquadev.aquareporter.com.au \
-  --email YOUR_EMAIL@example.com --agree-tos --no-eff-email -n
-```
-
-验证证书已落盘：
-
-```bash
-ls certs/live/
-# pro.aquareporter.com.au/    aquadev.aquareporter.com.au/
-
 ls certs/live/pro.aquareporter.com.au/
 # cert.pem  chain.pem  fullchain.pem  privkey.pem  README
 ```
 
----
-
-## 7. 立即关闭 80 端口
-
-回防火墙 / 云安全组，**删除**第 4 步那条临时入站规则。
-
-外网手机再次 `curl http://pro.aquareporter.com.au` 应**连接失败 / 超时**，证明 80 已对外关闭。
+> aquadev 保持 HTTP，不需要证书。如果之前已经签过 aquadev 的证书，证书文件留在 `certs/` 里不影响，也可以执行
+> `docker compose run --rm --entrypoint certbot certbot delete --cert-name aquadev.aquareporter.com.au` 主动清理。
 
 ---
 
-## 8. 切到阶段 2 配置（启用 HTTPS）
+## 5️⃣ 立刻关闭 80 端口
+
+回防火墙控制台，**删除**第 3 步那条临时规则。
+
+手机再次访问 `http://pro.aquareporter.com.au` 应**超时**，证明已对外关闭。
+
+---
+
+## 6️⃣ 本地构建 + 推送"阶段 2" image（HTTPS）
+
+```powershell
+cd D:\workspace\nginx-docker
+
+# 把阶段 2 配置覆盖到 nginx.conf
+copy /Y nginx.https.conf nginx.conf
+
+# 同一个 :https tag 覆盖推
+docker build -t adminpage.azurecr.io/nginx-docker:https .
+docker push adminpage.azurecr.io/nginx-docker:https
+
+# 还原本地仓库（让源码树里的 nginx.conf 回到阶段 1 干净状态）
+git checkout nginx.conf
+```
+
+服务器拉新 image + 起：
 
 ```bash
 cd ~/nginx-docker
-cp nginx.conf nginx.http.conf.bak   # 留一份阶段 1 备份
-cp nginx.https.conf nginx.conf
-docker build -t adminpage.azurecr.io/nginx-docker:latest .
-docker push adminpage.azurecr.io/nginx-docker:latest   # 如适用
 docker compose pull
 docker compose up -d
 docker compose ps
@@ -164,111 +134,83 @@ docker compose ps
 
 ---
 
-## 9. 验证 HTTPS
+## 7️⃣ 验证 HTTPS + 切换应用层
 
-**内网机器**：
+**内网验证**：
 
 ```bash
-curl -I https://pro.aquareporter.com.au
-# HTTP/2 200
+# pro：HTTPS
+curl -I https://pro.aquareporter.com.au          # HTTP/2 200
+curl -I http://pro.aquareporter.com.au           # 301 → https
 
-curl -I http://pro.aquareporter.com.au
-# HTTP/1.1 301 Moved Permanently
-# Location: https://pro.aquareporter.com.au/
+# aquadev：仍走 HTTP
+curl -I http://aquadev.aquareporter.com.au       # HTTP/1.1 200（不跳转）
 ```
 
-浏览器打开 `https://pro.aquareporter.com.au` 应看到地址栏**绿色锁**，没有警告。
+浏览器打开 `https://pro.aquareporter.com.au` 应有**绿色锁**，无警告。
 
----
-
-## 10. 应用层同步切换（关键！）
-
-### 10-1 后端 aquareporter-api 的 `.env`
+**改后端 `aquareporter-api/.env`**（仅 aquareporter，**adminpage 不动**）：
 
 ```bash
 PASSKEY_RP_ID=pro.aquareporter.com.au
 PASSKEY_RP_NAME=Aquareporter
 PASSKEY_ORIGINS=https://pro.aquareporter.com.au
-```
 
-改完后重启后端进程。
-
-### 10-2 Google OAuth 回调
-
-```bash
+# 如果有 Google OAuth，同步改
 GOOGLE_CALLBACK_URL=https://pro.aquareporter.com.au/api/auth/google/callback
 FRONTEND_URL=https://pro.aquareporter.com.au
 ```
 
-并到 [Google Cloud Console](https://console.cloud.google.com/) 把 OAuth
-回调 URL 改成 HTTPS 版本。
+记得到 Google Cloud Console 把 OAuth 回调 URL 加上 HTTPS 版本。
 
-### 10-3 adminpage 一侧同理
-
-如果 adminpage 项目也用了类似的 RP_ID / FRONTEND_URL，把 aquadev 的也改成 https。
+重启后端进程。
 
 ---
 
-## 11. 配置自动续期 cron
+## ✅ 验收：Passkey 端到端
 
-在服务器上：
+1. 浏览器访问 `https://pro.aquareporter.com.au` 用密码登录
+2. 进 **Settings → Security Settings**
+3. 点 **Add a passkey** → Touch ID / Face ID / Windows Hello → 列表出现新条目
+4. 退出登录 → 登录页点 **Sign in with passkey** → 一键完成登录
 
-```bash
-crontab -e
-```
-
-添加一行（每天 03:00 跑一次；certbot 自己判断到期）：
-
-```
-0 3 * * * /home/aquacentosadmin/nginx-docker/renew.sh >> /var/log/cert-renew.log 2>&1
-```
-
-> 注意：`renew.sh` 默认用 `ufw` 开关 80。如果你不用 ufw，编辑脚本里的
-> `OPEN_80` / `CLOSE_80` 改成你的防火墙命令（firewalld / iptables /
-> 云 CLI）。
->
-> 如果 cron 用 root 跑就不需要 `sudo`；用 aquacentosadmin 跑需要为
-> `ufw` 加 `NOPASSWD` 到 sudoers。
-
-查看续期日志：
-
-```bash
-tail -f /var/log/cert-renew.log
-```
-
-第一次手动跑一遍验证：
-
-```bash
-~/nginx-docker/renew.sh
-# 应该看到 certbot 输出"Certificate not yet due for renewal"，然后 nginx reload
-```
+至此 Passkey 在生产环境跑通。
 
 ---
 
-## 12. 回滚预案
+## ⚠️ 90 天后的续签（本次不做，做记录）
 
-如果切到 HTTPS 之后业务异常：
+证书 90 天到期。届时（提前 30 天内）只需重做一次步骤 3 → 4 → 5，把 `certonly` 命令换成 `renew` 即可。**不需要重新 build image**：
 
 ```bash
-cd ~/nginx-docker
-cp nginx.http.conf.bak nginx.conf    # 还原阶段 1 配置
-docker build -t adminpage.azurecr.io/nginx-docker:latest .
-docker compose up -d
+# 在服务器上
+sudo ufw allow 80/tcp
+docker compose run --rm --entrypoint certbot certbot renew --webroot -w /var/www/certbot
+sudo ufw delete allow 80/tcp
+docker exec nginx-reverse-proxy nginx -s reload
 ```
 
-证书 / acme bind mount 全部保留，下次重新切 HTTPS 时无需重新签发。
+仓库里附带的 `renew.sh` 已经把这套流程脚本化，将来要自动化时直接挂 cron 即可。
 
 ---
 
 ## 文件清单
 
-| 文件 | 用途 |
-|---|---|
-| `docker-compose.yml` | nginx + certbot 编排；bind mount `./certs` 和 `./acme` |
-| `Dockerfile` | EXPOSE 80 443 的自定义 nginx 镜像构建脚本 |
-| `nginx.conf` | **当前生效**配置（默认是阶段 1 HTTP-only） |
-| `nginx.https.conf` | 阶段 2 HTTPS 配置（签完证书后复制到 nginx.conf） |
-| `renew.sh` | 自动续期脚本，被 cron 调用 |
-| `certs/` | bind mount，证书目录（容器内 `/etc/letsencrypt`） |
-| `acme/` | bind mount，ACME challenge 交换目录 |
-| `logs/` | nginx 日志持久化 |
+| 文件 | 用途 | 烧进 image？ | 服务器需要？ |
+|---|---|---|---|
+| `Dockerfile` | 构建 image | ✅ | ❌ |
+| `nginx.conf` | 阶段 1：HTTP + ACME | ✅ | ❌ |
+| `nginx.https.conf` | 阶段 2 模板：HTTPS | ⚠️ 临时覆盖 nginx.conf 再 build | ❌ |
+| `docker-compose.yml` | 编排（image + 端口 + bind mount） | ❌ | ✅ vi 粘贴 |
+| `renew.sh` | 续签脚本（将来用） | ❌ | 续签时再传 |
+| `DEPLOY.md` | 本文档 | ❌ | ❌ |
+
+---
+
+## 回滚
+
+如果切到 HTTPS 之后业务异常：
+
+1. 本地把仓库还原到推阶段 1 之前的状态（或者直接基于当前 nginx.conf = 阶段 1 重新 build push 一次 `:https`），覆盖 ACR
+2. 服务器 `docker compose pull && docker compose up -d`
+3. `certs/` 和 `acme/` 目录保留，下次重新切 HTTPS 不必重新签发
