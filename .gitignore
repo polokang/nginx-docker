@@ -4,3 +4,6 @@ certs/
 acme/
 *.log
 nginx.http.conf.bak
+
+# Tunnel token 等敏感变量
+.env

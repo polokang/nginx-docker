@@ -239,6 +239,33 @@ curl -s -o /dev/null -w 'HTTP %{http_code}\n' -H "Host: pro.aquareporter.com.au"
 
 ---
 
+# 🌐 adminpage 外网访问（Cloudflare Tunnel + Access）
+
+外网入口 `https://<aquareporter.dev 下的域名>` **不经过本 nginx**：`cloudflared` 容器主动连出到 Cloudflare，把请求直接转给宿主机 `8000`（adminpage-web）。内网 `aquadev.aquareporter.com.au` 那条路不变。
+
+```
+外网  浏览器 → Cloudflare（Access 登录）→ cloudflared → host.docker.internal:8000 → adminpage-web → /api、/ws → adminpage-api
+内网  浏览器 → nginx-reverse-proxy:80   →              host.docker.internal:8000 → （同上）
+```
+
+## 一次性配置
+
+1. **Cloudflare Zero Trust → Networks → Tunnels → Create tunnel**（Cloudflared），复制 token。
+2. 该 tunnel 的 **Public Hostname**：域名选 `aquareporter.dev`（或其子域），Service 填 `HTTP` / `host.docker.internal:8000`。
+3. **Access → Applications → Add → Self-hosted**：域名同上，Policy 只允许指定邮箱 / 公司邮箱域名（One-time PIN 或 SSO）。**没有这一步，外网任何人都能打开 adminpage 登录页。**
+4. 服务器上：
+
+```bash
+cd ~/nginx-docker && cp .env.example .env && vi .env   # 填 TUNNEL_TOKEN
+docker compose pull && docker compose up -d cloudflared && docker compose logs -f cloudflared
+```
+
+日志出现 `Registered tunnel connection` 即通。只 `up -d cloudflared` 不会动 nginx 容器。
+
+> Cloudflare 免费版单次请求最长约 100 秒；adminpage 里耗时特别长的导出走外网可能被切断，走内网域名不受影响。
+
+---
+
 # ⚙️ 应用层配置
 
 切到 HTTPS 后，后端 `aquareporter-api/.env` 需同步（**仅 aquareporter，adminpage 不动**）：

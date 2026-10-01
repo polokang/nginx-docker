@@ -36,3 +36,28 @@ services:
       - ./certs:/etc/letsencrypt
       - ./acme:/var/www/certbot
     profiles: ["tools"]   # docker compose up 默认不启动它
+
+  # ── Cloudflare Tunnel：adminpage 的外网入口 ──────────────────────────
+  # cloudflared 只做**出站**连接到 Cloudflare，不监听任何宿主机端口，所以外网
+  # 访问 adminpage 不需要在 NSG 里对公网开放任何入站端口；TLS 由 Cloudflare 终结，
+  # 登录由 Cloudflare Access 拦在最前面，通过后才会转到 adminpage-web。
+  #
+  # 路由（域名 -> 服务）在 Cloudflare Zero Trust 控制台里配（Networks -> Tunnels ->
+  # Public Hostname），这里不用写。服务地址填：  http://host.docker.internal:8000
+  #
+  # TUNNEL_TOKEN 放在服务器 ~/nginx-docker/.env 里（见 .env.example），不进仓库。
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
+    restart: always
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${TUNNEL_TOKEN:?请在 ~/nginx-docker/.env 里设置 TUNNEL_TOKEN}
+    # 和 nginx 同样的办法回连宿主机上发布的 8000 端口
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
