@@ -45,6 +45,11 @@ services:
   # 路由（域名 -> 服务）在 Cloudflare Zero Trust 控制台里配（Networks -> Tunnels ->
   # Public Hostname），这里不用写。服务地址填：  http://host.docker.internal:8000
   #
+  # 同一个 tunnel 还承载 aquareporter-data 数据服务：
+  #   data.aquareporter.dev -> http://host.docker.internal:3100
+  # 它只给旧版 aquareporter（IIS）后端调用，用 Cloudflare WAF 做 IP 白名单，不走 Access 邮箱登录。
+  # 详见 readme.md「aquareporter-data 数据服务」一节。
+  #
   # TUNNEL_TOKEN 放在服务器 ~/nginx-docker/.env 里（见 .env.example），不进仓库。
   cloudflared:
     image: cloudflare/cloudflared:latest

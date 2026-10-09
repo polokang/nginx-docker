@@ -24,6 +24,8 @@
 | `pro.aquareporter.com.au/api/` | **HTTPS** | `http://host.docker.internal:8088` | Aquareporter API；同源同端口，避免 Mixed Content |
 | `aquadev.aquareporter.com.au` | HTTP | `http://host.docker.internal:8000` | adminpage 内网访问，不做 TLS 终结 |
 
+另外有两条外网入口走 Cloudflare Tunnel，不经过本 nginx：adminpage（见 [adminpage 外网访问](#-adminpage-外网访问cloudflare-tunnel--access)）和 aquareporter-data 数据服务（`host.docker.internal:3100`，只允许指定 IP 访问，见 [aquareporter-data 数据服务](#-aquareporter-data-数据服务cloudflare-tunnel--ip-白名单)）。
+
 80 端口上 `pro` 只保留 `/.well-known/acme-challenge/`（供 Let's Encrypt 验证），其余一律 301 到 HTTPS；`aquadev` 全部走 80 不跳转。
 
 ## 🚀 快速启动
@@ -263,6 +265,66 @@ docker compose pull && docker compose up -d cloudflared && docker compose logs -
 日志出现 `Registered tunnel connection` 即通。只 `up -d cloudflared` 不会动 nginx 容器。
 
 > Cloudflare 免费版单次请求最长约 100 秒；adminpage 里耗时特别长的导出走外网可能被切断，走内网域名不受影响。
+
+---
+
+# 📈 aquareporter-data 数据服务（Cloudflare Tunnel + IP 白名单）
+
+一分钟数据微服务 [aquareporter-data](../aquareporter-data) 也部署在这台服务器上，复用同一个 `cloudflared` 隧道对外提供服务，**不经过本 nginx**。它只给旧版 aquareporter（IIS，`www.aquareporter.com.au`）的**后端**调用，浏览器不会直接访问它。所以这里不走 Access 邮箱登录，改为只允许指定 IP 访问。
+
+```
+浏览器 → IIS (www.aquareporter.com.au) POST /api/Data/{id}
+           └─ IIS 后端 → https://data.aquareporter.dev → Cloudflare（IP 白名单）→ cloudflared → host.docker.internal:3100 → aquareporter-data
+           └─ CSV 流式转发回浏览器
+```
+
+域名 `data.aquareporter.dev` 是示例，可以换成 `aquareporter.dev` 下的任意子域，但要和 IIS 上的 `DataServiceBaseUrl` 保持一致。
+
+## 一次性配置
+
+1. **添加隧道路由**：Zero Trust → **Networks → Tunnels & Mesh → adminpage** → 顶部标签 **Published application routes**（旧版界面叫 Public Hostname）→ **Add a published application route**。按下面填写：
+   - Subdomain：`data`
+   - Domain：`aquareporter.dev`
+   - Path：留空
+   - Service Type：`HTTP`
+   - URL：`host.docker.internal:3100`
+
+   注意不要选 **Hostname routes**，那是给 WARP 客户端访问内网用的。
+2. **检查有没有通配的 Access 应用**：Zero Trust → **Access controls → Applications**，看 adminpage 那个应用的域名：
+   - 如果只写了 adminpage 自己的子域名（不是 `*`），新加的 `data` 子域不受它影响，**跳过第 3 步**。
+   - 如果是 `*.aquareporter.dev` 这样的通配域名，它也会拦住 `data` 子域并要求邮箱登录。这时必须做第 3 步。
+3. **（仅在存在通配应用时）加一个 Bypass 应用**：**Access controls → Applications → Add an application → Self-hosted**，按下面填写：
+   - Application domain：`data.aquareporter.dev`
+   - Policy：新建一条策略，Action 选 **Bypass**；Include 的 Selector 选 **IP ranges**，填 `40.82.202.175`、`103.17.250.78`、`220.233.36.27`（每个 IP 后面加 `/32`）
+
+   不要加其他策略。Cloudflare 会优先匹配更具体的域名，所以对 `data` 子域来说，这个应用优先于通配应用：白名单内的 IP 直接放行，其余 IP 不命中任何策略，会被拦截。
+4. **WAF IP 白名单**（不管有没有第 3 步都要做；这条规则在 Access 之前生效，白名单外的请求直接返回 403）：
+   1. 点左上角返回账户首页，选域名 `aquareporter.dev`，进入 **Security → Security rules**（旧版界面叫 WAF → Custom rules）。
+   2. **Create rule → Custom rule**，点 **Edit expression**，粘贴下面的表达式：
+
+      ```
+      (http.host eq "data.aquareporter.dev" and not ip.src in {40.82.202.175 103.17.250.78 220.233.36.27})
+      ```
+
+   3. Action 选 **Block**，然后 **Deploy**。
+5. **核对 IIS 的出口 IP**：`40.82.202.175` 是 `www` 的**入站** IP。IIS 主动访问外部时用的出口 IP 不一定是它，需要在 IIS 那台机器上执行下面的命令确认，以输出结果为准填进白名单：
+
+   ```powershell
+   (Invoke-WebRequest -UseBasicParsing https://ifconfig.me/ip).Content
+   ```
+
+6. 数据服务的部署和 `.env` 配置见 aquareporter-data 的 README。容器端口要绑定 `0.0.0.0:3100`，cloudflared 才能通过 `host.docker.internal` 访问到它。Azure NSG **不需要**放行 3100，外部流量一律从隧道进来。
+
+## 验证
+
+```bash
+# 在白名单 IP 上执行：应返回 {"status":"ready"}
+curl https://data.aquareporter.dev/readyz
+# 不带 token 调数据接口：应返回 401（说明请求已经穿过 Cloudflare，到达了数据服务）
+curl -X POST https://data.aquareporter.dev/v1/units/1/data/export
+```
+
+在白名单之外的 IP 上访问，应该被 Cloudflare 拦截（WAF 返回 403，或者出现 Access 登录页）。
 
 ---
 
