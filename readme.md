@@ -23,10 +23,14 @@
 | `pro.aquareporter.com.au` | **HTTPS**（HTTP 301 跳转） | `http://host.docker.internal:8888` | Aquareporter Web；Passkey/WebAuthn 需要 secure context |
 | `pro.aquareporter.com.au/api/` | **HTTPS** | `http://host.docker.internal:8088` | Aquareporter API；同源同端口，避免 Mixed Content |
 | `aquadev.aquareporter.com.au` | HTTP | `http://host.docker.internal:8000` | adminpage 内网访问，不做 TLS 终结 |
+| `www.aquareporter.dev` | HTTP（Cloudflare Tunnel 入口） | `http://host.docker.internal:8888` | Aquareporter Pro 外网入口；TLS 在 Cloudflare 终结 |
+| `www.aquareporter.dev/api/` | HTTP（Cloudflare Tunnel 入口） | `http://host.docker.internal:8088` | 同上；路径分流仍在本 nginx 完成 |
 
-另外有两条外网入口走 Cloudflare Tunnel，不经过本 nginx：adminpage（见 [adminpage 外网访问](#-adminpage-外网访问cloudflare-tunnel--access)）和 aquareporter-data 数据服务（`host.docker.internal:3100`，只允许指定 IP 访问，见 [aquareporter-data 数据服务](#-aquareporter-data-数据服务cloudflare-tunnel--ip-白名单)）。
+`www.aquareporter.dev` 虽然也走本 nginx，但**不是从公网 443 进来的** —— 它经由 `cloudflared` 隧道回连本机 80，见 [www.aquareporter.dev 外网访问](#-wwwaquareporterdev-外网访问cloudflare-tunnel--本-nginx)。
 
-80 端口上 `pro` 只保留 `/.well-known/acme-challenge/`（供 Let's Encrypt 验证），其余一律 301 到 HTTPS；`aquadev` 全部走 80 不跳转。
+另外有两条外网入口走 Cloudflare Tunnel 且**不经过**本 nginx：adminpage（见 [adminpage 外网访问](#-adminpage-外网访问cloudflare-tunnel--access)）和 aquareporter-data 数据服务（`host.docker.internal:3100`，只允许指定 IP 访问，见 [aquareporter-data 数据服务](#-aquareporter-data-数据服务cloudflare-tunnel--ip-白名单)）。
+
+80 端口上 `pro` 只保留 `/.well-known/acme-challenge/`（供 Let's Encrypt 验证），其余一律 301 到 HTTPS；`aquadev` 和 `www` 全部走 80 不跳转（`www` 的 TLS 已由 Cloudflare 终结，再跳会跳回 Cloudflare 形成死循环）。
 
 ## 🚀 快速启动
 
@@ -265,6 +269,64 @@ docker compose pull && docker compose up -d cloudflared && docker compose logs -
 日志出现 `Registered tunnel connection` 即通。只 `up -d cloudflared` 不会动 nginx 容器。
 
 > Cloudflare 免费版单次请求最长约 100 秒；adminpage 里耗时特别长的导出走外网可能被切断，走内网域名不受影响。
+
+---
+
+# 🌐 www.aquareporter.dev 外网访问（Cloudflare Tunnel → 本 nginx）
+
+Aquareporter Pro 的外网入口。和 adminpage / data 两条隧道不同，它**经过本 nginx**：隧道只负责把请求送到本机 80，`/api/` 与 `/` 的分流仍由 `nginx.conf` 里的 `www.aquareporter.dev` server 块完成，和 `pro.aquareporter.com.au` 共用同一套规则，以后加 location 只改 nginx 一处。
+
+为什么不能用 A 记录直连 `4.147.162.158`：Azure NSG 的 80/443 只放行公司出口 IP（`103.17.250.78`、`220.233.36.27`），Cloudflare 回源 IP 不在白名单里，直连必然超时。隧道是**出站**连接，不需要动 NSG。
+
+```
+外网  浏览器 → Cloudflare（TLS 终结）→ cloudflared → host.docker.internal:80 → nginx
+                                                       ├─ /api/ → host.docker.internal:8088（aquareporter-api）
+                                                       └─ /     → host.docker.internal:8888（aquareporter-web）
+```
+
+## 一次性配置
+
+1. **添加隧道路由**：Zero Trust → **Networks → Tunnels & Mesh → adminpage** → **Published application routes** → **Add a published application route**：
+   - Subdomain：`www`
+   - Domain：`aquareporter.dev`
+   - Path：留空
+   - Service Type：`HTTP`
+   - URL：`host.docker.internal:80`
+
+   保存后 Cloudflare 会自动建好 `www` 的 CNAME（橙云代理），**不需要**手工加 DNS 记录。
+
+2. **确认 Access 会不会把它一起拦下**：Zero Trust → **Access controls → Applications**，看 adminpage 那个应用的域名：
+   - 写的是具体子域 → `www` 不受影响，pro 外网直接可访问。
+   - 写的是 `*.aquareporter.dev` → `www` 会弹出邮箱登录页。不想要这层登录，就照 data 子域那套做法，给 `www.aquareporter.dev` 单建一个 Self-hosted 应用，策略 Action 选 **Bypass**、Include 选 Everyone。Cloudflare 优先匹配更具体的域名，它会盖过通配应用。
+
+3. **WAF**：现有那条自定义规则的表达式锁死了 `http.host eq "data.aquareporter.dev"`，不会误伤 `www`。确认 Security rules 里没有更宽的 Block 规则即可。
+
+4. **nginx 侧**：`nginx.conf` 里已经有 `www.aquareporter.dev` 的 server 块，改动后需要重新 build / push image 并在服务器 `docker compose pull && docker compose up -d`（见[发布流程](#-发布流程)）。
+
+> 这个 server 块里有两处和 pro 块刻意不同：`X-Forwarded-Proto` 写死 `https`（`$scheme` 在这里是 `http`，后端据此生成绝对 URL 或设 secure cookie 会出错），`X-Real-IP` 取 `$http_cf_connecting_ip`（真实客户端 IP，否则日志里全是 docker 网关地址）。另外**不做 301 跳 HTTPS** —— TLS 已在 Cloudflare 终结，再跳会跳回 Cloudflare 形成死循环。
+
+## ⚠️ 应用层的连带影响（上线前必须先定）
+
+**`www.aquareporter.dev` 是取代 `pro.aquareporter.com.au`，还是和它并存？** 这决定了下面几项怎么改（都在 `aquareporter-api/.env`）：
+
+*   **Passkey 不可能两边都用**。`PASSKEY_RP_ID` 必须是访问来源域名的可注册后缀，而 `aquareporter.dev` 和 `aquareporter.com.au` 是两个完全不同的根域 —— 一个 RP_ID 覆盖不了两边，`PASSKEY_ORIGINS` 能填多个也救不了。改成 `aquareporter.dev` 的话，**已注册的 passkey 全部作废**，用户要先用密码登录再重新添加。建议选一个域名做唯一正式入口。
+*   **`GOOGLE_CALLBACK_URL` / `FRONTEND_URL`** 都是单值（后者还用于邀请邮件里的链接），换域名要同步改，并到 Google Cloud Console 把新的回调 URL 加进 Authorized redirect URIs。
+*   **CORS 不受影响** —— `aquareporter-api/src/index.ts` 是 `app.use(cors())` 全开。
+*   **Cloudflare 免费版单次请求最长约 100 秒**，pro 里耗时特别长的导出走外网可能被切断，走 `pro.aquareporter.com.au` 不受影响。
+
+## 验证
+
+```bash
+curl -I https://www.aquareporter.dev          # HTTP/2 200，不应有 301
+```
+
+分不清是 nginx 的问题还是隧道的问题时，在服务器上绕开 Cloudflare 直接打 nginx：
+
+```bash
+docker exec nginx-reverse-proxy curl -s -o /dev/null -w 'HTTP %{http_code}\n' -H 'Host: www.aquareporter.dev' http://127.0.0.1/
+```
+
+`HTTP 200` 说明 nginx 侧完全正常，问题在隧道或 Cloudflare 配置上；再看 `docker compose logs cloudflared`。
 
 ---
 
