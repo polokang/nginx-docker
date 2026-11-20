@@ -25,12 +25,14 @@
 | `aquadev.aquareporter.com.au` | HTTP | `http://host.docker.internal:8000` | adminpage 内网访问，不做 TLS 终结 |
 | `www.aquareporter.dev` | HTTP（Cloudflare Tunnel 入口） | `http://host.docker.internal:8888` | Aquareporter Pro 外网入口；TLS 在 Cloudflare 终结 |
 | `www.aquareporter.dev/api/` | HTTP（Cloudflare Tunnel 入口） | `http://host.docker.internal:8088` | 同上；路径分流仍在本 nginx 完成 |
+| `m.aquareporter.dev` | HTTP（Cloudflare Tunnel 入口） | `http://host.docker.internal:8890` | **手机端**（aquareporter-mobile，antd-mobile）；TLS 在 Cloudflare 终结 |
+| `m.aquareporter.dev/api/` | HTTP（Cloudflare Tunnel 入口） | `http://host.docker.internal:8088` | 和 www 同一个后端 |
 
-`www.aquareporter.dev` 虽然也走本 nginx，但**不是从公网 443 进来的** —— 它经由 `cloudflared` 隧道回连本机 80，见 [www.aquareporter.dev 外网访问](#-wwwaquareporterdev-外网访问cloudflare-tunnel--本-nginx)。
+`www.aquareporter.dev` 和 `m.aquareporter.dev` 虽然也走本 nginx，但**不是从公网 443 进来的** —— 它们经由 `cloudflared` 隧道回连本机 80，见 [www.aquareporter.dev 外网访问](#-wwwaquareporterdev-外网访问cloudflare-tunnel--本-nginx) 和 [m.aquareporter.dev 手机端](#-maquareporterdev-手机端cloudflare-tunnel--本-nginx)。
 
 另外有两条外网入口走 Cloudflare Tunnel 且**不经过**本 nginx：adminpage（见 [adminpage 外网访问](#-adminpage-外网访问cloudflare-tunnel--access)）和 aquareporter-data 数据服务（`host.docker.internal:3100`，只允许指定 IP 访问，见 [aquareporter-data 数据服务](#-aquareporter-data-数据服务cloudflare-tunnel--ip-白名单)）。
 
-80 端口上 `pro` 只保留 `/.well-known/acme-challenge/`（供 Let's Encrypt 验证），其余一律 301 到 HTTPS；`aquadev` 和 `www` 全部走 80 不跳转（`www` 的 TLS 已由 Cloudflare 终结，再跳会跳回 Cloudflare 形成死循环）。
+80 端口上 `pro` 只保留 `/.well-known/acme-challenge/`（供 Let's Encrypt 验证），其余一律 301 到 HTTPS；`aquadev`、`www` 和 `m` 全部走 80 不跳转（`www` / `m` 的 TLS 已由 Cloudflare 终结，再跳会跳回 Cloudflare 形成死循环）。
 
 ## 🚀 快速启动
 
@@ -330,6 +332,68 @@ docker exec nginx-reverse-proxy curl -s -o /dev/null -w 'HTTP %{http_code}\n' -H
 
 ---
 
+# 📱 m.aquareporter.dev 手机端（Cloudflare Tunnel → 本 nginx）
+
+手机端前端 [aquareporter-mobile](../Aquareporter-pro/aquareporter-mobile)（antd-mobile）的外网入口。和 `www` **完全同一条路**：同一条隧道、同一个 nginx、同一个后端 `8088`，唯一的区别是 `/` 转到 **8890** 而不是 8888。
+
+```
+外网  浏览器 → Cloudflare（TLS 终结）→ cloudflared → host.docker.internal:80 → nginx
+                                                       ├─ /api/ → host.docker.internal:8088（aquareporter-api，和 www 共用）
+                                                       └─ /     → host.docker.internal:8890（aquareporter-mobile）
+```
+
+手机端容器由 `Aquareporter-pro/docker-compose.yml` 一起拉起（api 8088 / web 8888 / mobile 8890），见那边的 `aquareporter-mobile/README.md`。
+
+## 一次性配置
+
+1. **加隧道路由**：Zero Trust → **Networks → Tunnels & Mesh → adminpage** → **Published application routes** → **Add a published application route**：
+   - Subdomain：`m`
+   - Domain：`aquareporter.dev`
+   - Path：留空
+   - Service Type：`HTTP`
+   - URL：`host.docker.internal:80`
+
+   保存后 Cloudflare 会自动建好 `m` 的 CNAME（橙云代理），**不需要**手工加 DNS 记录。
+
+2. **确认 Access 会不会把它一起拦下**：Zero Trust → **Access controls → Applications**，看 adminpage 那个应用的域名 —— 写的是具体子域 → `m` 不受影响；写的是 `*.aquareporter.dev` → `m` 会弹邮箱登录页，这时照 `data` 子域那套做法给 `m.aquareporter.dev` 单建一个 Self-hosted 应用，策略 Action 选 **Bypass**、Include 选 Everyone。
+
+3. **WAF**：现有那条自定义规则锁死了 `http.host eq "data.aquareporter.dev"`，不会误伤 `m`。确认 Security rules 里没有更宽的 Block 规则即可。
+
+4. **nginx 侧**：`nginx.conf` 里已经有 `m.aquareporter.dev` 的 server 块，改动后需要重新 build / push image 并在服务器 `docker compose pull && docker compose up -d`（见[发布流程](#-发布流程)）。
+
+证书不用管（TLS 在 Cloudflare 终结），Azure NSG 也不用动（隧道是**出站**连接）。
+
+> 这个 server 块和 `www` 块的注意事项完全相同：`X-Forwarded-Proto` 写死 `https`、`X-Real-IP` 取 `$http_cf_connecting_ip`、**不做 301 跳 HTTPS**。
+>
+> 它**没有** `/agent/`：手机端没有 AI 助手页面。将来要加，把 `www` 块里那段 `location /agent/` 原样抄过来即可。
+
+## ⚠️ 两个和 www 不同的点
+
+*   **登录态不和 www 互通**。token 存在 `localStorage`，而 localStorage 是**按 origin 隔离**的 —— `www.aquareporter.dev` 和 `m.aquareporter.dev` 是两个 origin，各登各的。两端代码里 token 的 key 一样（都是 `token`），意义只在于将来真要合并到同一域名时不用改代码。
+*   **手机端没有 passkey 登录**（只有邮箱 + 密码），所以上面 www 那节讲的 `PASSKEY_RP_ID` 冲突暂时影响不到它。将来要在手机端加 passkey，得先把正式入口统一到一个根域，把 RP_ID 改成 `aquareporter.dev`（这样 `www` 和 `m` 两个子域都覆盖），代价是**已注册的 passkey 全部作废**。
+
+## 验证
+
+```bash
+curl -I https://m.aquareporter.dev          # HTTP/2 200，不应有 301
+```
+
+绕开 Cloudflare 直接打 nginx（分辨是 nginx 的问题还是隧道的问题）：
+
+```bash
+docker exec nginx-reverse-proxy curl -s -o /dev/null -w 'HTTP %{http_code}\n' -H 'Host: m.aquareporter.dev' http://127.0.0.1/
+```
+
+SPA 回落也顺带验一下（二级路由不该 404）：
+
+```bash
+docker exec nginx-reverse-proxy curl -s -o /dev/null -w 'HTTP %{http_code}\n' -H 'Host: m.aquareporter.dev' http://127.0.0.1/controllers
+```
+
+两条都是 `HTTP 200` 说明 nginx + 手机端容器都正常，问题在隧道或 Cloudflare 配置上。
+
+---
+
 # 📈 aquareporter-data 数据服务（Cloudflare Tunnel + IP 白名单）
 
 一分钟数据微服务 [aquareporter-data](../aquareporter-data) 也部署在这台服务器上，复用同一个 `cloudflared` 隧道对外提供服务，**不经过本 nginx**。它只给旧版 aquareporter（IIS，`www.aquareporter.com.au`）的**后端**调用，浏览器不会直接访问它。所以这里不走 Access 邮箱登录，改为只允许指定 IP 访问。
@@ -421,7 +485,7 @@ FRONTEND_URL=https://pro.aquareporter.com.au
 |---|---|:---:|:---:|
 | `Dockerfile` | 镜像构建（基于 `nginx:alpine`，`EXPOSE 80 443`） | ✅ | ❌ |
 | `nginx.conf` | **当前生效配置**：pro 走 HTTPS + 80 保留 ACME 路径，aquadev 走 HTTP | ✅ | ❌ |
-| `nginx.https.conf` | 历史模板，内容与 `nginx.conf` 相同（仅注释不同） | ❌ | ❌ |
+| `nginx.https.conf` | 历史模板，**已经落后于 `nginx.conf`，不要再 `cp` 覆盖**（见下方说明） | ❌ | ❌ |
 | `docker-compose.yml` | 编排：nginx 服务 + certbot 工具容器 + bind mount + 健康检查 | ❌ | ✅ |
 | `renew.sh` | 续签脚本（**当前不可用**，见上方说明） | ❌ | ❌ |
 | `readme.md` | 本文档 | ❌ | ❌ |
@@ -430,6 +494,16 @@ FRONTEND_URL=https://pro.aquareporter.com.au
 | `logs/` | nginx 日志持久化 | ❌ | ✅ |
 
 `certs/` `acme/` `logs/` 已在 `.gitignore` 中，证书和私钥不会被提交。
+
+> ## ⚠️ `nginx.https.conf` 已经不能当模板用了
+>
+> 它文件头的注释写着「启用方式：`cp nginx.https.conf nginx.conf`」—— **照做会静默丢掉三样东西**，而且 nginx 照常启动、不报任何错：
+>
+> 1. `client_max_body_size 100m`（丢了之后生产平板传 3-8MB 的照片一律 413）
+> 2. `pro` 和 `www` 两个块里的 `location /agent/`（丢了之后 AI 助手整个不可用）
+> 3. `m.aquareporter.dev` 整个 server 块（丢了之后手机端域名落到默认 server，拿不到 8890）
+>
+> **`nginx.conf` 才是唯一的事实来源**，要改就直接改它。这个文件留着只是历史参考。
 
 > **已知缺口**：`nginx.conf` 需要 `certs/live/pro.aquareporter.com.au/` 下的证书存在才能启动。在一台 `certs/` 为空的全新机器上，这个 image 会起不来，无法完成首次签发。真要重新做首次部署，得先准备一份 HTTP-only 的引导配置（把 443 server 块注释掉）先跑起来，签完证书再换回完整配置。
 
