@@ -1,0 +1,65 @@
+version: '3.8'
+
+services:
+  nginx:
+    image: adminpage.azurecr.io/nginx-docker:https
+    container_name: nginx-reverse-proxy
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sI http://127.0.0.1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    volumes:
+      - ./logs:/var/log/nginx
+      # ── Let's Encrypt 集中存放（bind mount，路径透明可见）─────────────
+      # 容器内 /etc/letsencrypt 是 certbot 固定写入路径；映射到 ./certs
+      # 让两个域名（pro / aquadev）的证书都按子目录归档在这里。
+      - ./certs:/etc/letsencrypt
+      # ACME HTTP-01 challenge 静态文件交换区：certbot 写、nginx 读
+      - ./acme:/var/www/certbot
+    # 这一行确保了 host.docker.internal 可以正确映射到宿主机（服务器）的 IP，兼容 Linux 服务器
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ── Certbot：按需运行（默认不启动） ──────────────────────────────────
+  # 申请 / 续期都用：
+  #   docker compose run --rm --entrypoint certbot certbot <args>
+  # 这样跑完即销毁，不占资源、不影响 nginx 主进程。
+  certbot:
+    image: certbot/certbot:latest
+    container_name: certbot
+    volumes:
+      - ./certs:/etc/letsencrypt
+      - ./acme:/var/www/certbot
+    profiles: ["tools"]   # docker compose up 默认不启动
+
+
+  # ── Cloudflare Tunnel：adminpage 的外网入口 ──────────────────────────
+  # cloudflared 只做**出站**连接到 Cloudflare，不监听任何宿主机端口，所以外网
+  # 访问 adminpage 不需要在 NSG 里对公网开放任何入站端口；TLS 由 Cloudflare 终结，
+  # 登录由 Cloudflare Access 拦在最前面，通过后才会转到 adminpage-web。
+  #
+  # 路由（域名 -> 服务）在 Cloudflare Zero Trust 控制台里配（Networks -> Tunnels ->
+  # Public Hostname），这里不用写。服务地址填：  http://host.docker.internal:8000
+  #
+  # TUNNEL_TOKEN 放在服务器 ~/nginx-docker/.env 里（见 .env.example），不进仓库。
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
+    restart: always
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${TUNNEL_TOKEN:?请在 ~/nginx-docker/.env 里设置 TUNNEL_TOKEN}
+    # 和 nginx 同样的办法回连宿主机上发布的 8000 端口
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
