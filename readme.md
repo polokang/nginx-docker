@@ -27,6 +27,7 @@
 | `www.aquareporter.dev/api/` | HTTP（Cloudflare Tunnel 入口） | `http://host.docker.internal:8088` | 同上；路径分流仍在本 nginx 完成 |
 | `m.aquareporter.dev` | HTTP（Cloudflare Tunnel 入口） | `http://host.docker.internal:8890` | **手机端**（aquareporter-mobile，antd-mobile）；TLS 在 Cloudflare 终结 |
 | `m.aquareporter.dev/api/` | HTTP（Cloudflare Tunnel 入口） | `http://host.docker.internal:8088` | 和 www 同一个后端 |
+| `m.aquareporter.dev/agent/` | HTTP（Cloudflare Tunnel 入口） | `http://aquareporter-agent:8080` | 手机端 AI 助手；SSE 流式，走容器名 |
 
 `www.aquareporter.dev` 和 `m.aquareporter.dev` 虽然也走本 nginx，但**不是从公网 443 进来的** —— 它们经由 `cloudflared` 隧道回连本机 80，见 [www.aquareporter.dev 外网访问](#-wwwaquareporterdev-外网访问cloudflare-tunnel--本-nginx) 和 [m.aquareporter.dev 手机端](#-maquareporterdev-手机端cloudflare-tunnel--本-nginx)。
 
@@ -365,7 +366,7 @@ docker exec nginx-reverse-proxy curl -s -o /dev/null -w 'HTTP %{http_code}\n' -H
 
 > 这个 server 块和 `www` 块的注意事项完全相同：`X-Forwarded-Proto` 写死 `https`、`X-Real-IP` 取 `$http_cf_connecting_ip`、**不做 301 跳 HTTPS**。
 >
-> 它**没有** `/agent/`：手机端没有 AI 助手页面。将来要加，把 `www` 块里那段 `location /agent/` 原样抄过来即可。
+> `/agent/` 那段**不要照抄 `/api/`**：AI 助手是 SSE 流式的，必须保留 `proxy_buffering off` / `proxy_cache off` / `gzip off` 和 300s 超时，否则 nginx 会把整段响应攒到最后一次性吐出来，流式效果全没了。它和 `pro` / `www` 一样走容器名 `aquareporter-agent:8080`（agent 不映射宿主机端口，靠 `nginx-docker_default` 网络 + Docker 内置 DNS `127.0.0.11`）。
 
 ## ⚠️ 两个和 www 不同的点
 
@@ -391,6 +392,15 @@ docker exec nginx-reverse-proxy curl -s -o /dev/null -w 'HTTP %{http_code}\n' -H
 ```
 
 两条都是 `HTTP 200` 说明 nginx + 手机端容器都正常，问题在隧道或 Cloudflare 配置上。
+
+AI 助手单独验一条（agent 走容器名，和前两条不是一个上游）：
+
+```bash
+docker exec nginx-reverse-proxy curl -s -H 'Host: m.aquareporter.dev' http://127.0.0.1/agent/health
+```
+
+返回 `{"ok":true,...}` 说明 nginx 到 agent 容器这一段通了。`502` 一般是
+`aquareporter-agent` 没起、或者它没加入 `nginx-docker_default` 网络。
 
 ---
 
